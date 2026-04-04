@@ -35,7 +35,7 @@ f9c3d308-7c2c-47d9-bf7f-9e226d7d5839  prob=0.754  shared=0.00  copost=0  fr_bot=
 fa914ae7-e68b-4dbf-a00c-1c52768bc3c3  prob=0.820  shared=0.00  copost=0  fr_bot=0.00  dup=0.00  burst=0.00
 fccf19fe-0185-4cce-aa92-0768c300eb7d  prob=0.997  shared=0.00  copost=0  fr_bot=0.00  dup=0.00  burst=0.00
 Flagged 29 / 436 users
-Detections written to: detections_eng2.txt
+Detections written to: detections_eng.txt
 
 
 french (FP veto enabled)
