@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-import detector as det
+import detector3 as det
 
 
 def safe_stdout():
@@ -29,10 +29,18 @@ def eval_fold(test_posts, test_bots, train_pairs, verbose_cv=False, model="ensem
     x_train, y_train = det.load_training_concat(train_pairs)
     clf, thr, cv_info = det.train_model(x_train, y_train, verbose=verbose_cv, model=model)
 
-    user_ids, _, x_test, _ = det.load_dataset(test_posts)
+    user_ids, _, x_test, feat_names = det.load_dataset(test_posts)
     gt = det.load_bot_ids(test_bots)
     y_true = np.array([1 if uid in gt else 0 for uid in user_ids], dtype=int)
     probs = clf.predict_proba(x_test)[:, 1]
+    # --- DEBUG ---
+    print(f"\n  [DEBUG] {short_label(test_posts)}")
+    for uid, prob, feat_row, true_label in zip(user_ids, probs, x_test, y_true):
+        feat_dict = dict(zip(feat_names, feat_row))
+        if prob > 0.1:  # low threshold to catch misses too
+            status = "BOT" if true_label == 1 else "FP?"
+            print(f"    [{status}] {uid}  prob={prob:.3f}  shared={feat_dict['shared_text_frac']:.2f}  copost={feat_dict['coposter_count']:.0f}  fr_bot={feat_dict['fr_bot_pressure']:.2f}  dup={feat_dict['duplicate_fraction']:.2f}  burst={feat_dict['burst_fraction_10s']:.2f}  vocab={feat_dict['vocab_richness']:.2f}")
+    # --- END DEBUG ---
     y_pred = (probs >= thr).astype(int)
 
     score, tp, fn, fp = det.competition_score_from_preds(y_true, y_pred)
@@ -61,6 +69,7 @@ def eval_fold(test_posts, test_bots, train_pairs, verbose_cv=False, model="ensem
     }
 
 
+
 def run_lang(lang, train_dirs, verbose_cv, model):
     all_pairs = []
     for d in train_dirs:
@@ -80,7 +89,6 @@ def run_lang(lang, train_dirs, verbose_cv, model):
         m = eval_fold(holdout[0], holdout[1], train, verbose_cv=verbose_cv, model=model)
         rows.append(m)
     return rows
-
 
 def print_table(rows, title):
     if not rows:

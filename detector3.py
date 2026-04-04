@@ -6,6 +6,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+import warnings
 
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
@@ -17,7 +18,7 @@ SCORE_FN = -2
 SCORE_FP = -6
 
 def safe_stdout():
-    # Avoid Windows cp1252 crashes when printing emojis/accents.
+    # avoid windows cp1252 crashes when printing emojis/accents.
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
@@ -49,7 +50,79 @@ def _char_entropy(s):
     return _entropy_from_counts(list(freq.values()))
 
 
-def extract_features(user, posts, dataset_lang=None):
+def build_coordination_index(posts_by_user):
+    """
+    Build cross-user coordination signals from the full dataset posts.
+
+    Returns a dict: uid -> {
+        "shared_text_frac":      fraction of this user's posts that appear verbatim
+                                 in at least one other account,
+        "coposter_count":        number of distinct accounts that posted within 60 s
+                                 with the exact same text (max over all posts),
+        "coord_coposter_total":  total co-posting events (sum across all posts),
+    }
+    """
+    # text -> list of (uid, timestamp)
+    text_to_occurrences: dict[str, list] = defaultdict(list)
+    for uid, posts in posts_by_user.items():
+        for p in posts:
+            norm = p["text"].strip().lower()
+            if norm:
+                try:
+                    ts = parse_ts(p["created_at"])
+                except Exception:
+                    ts = None
+                text_to_occurrences[norm].append((uid, ts))
+
+    # texts that appear in >1 distinct account
+    shared_texts: set[str] = {
+        txt for txt, occs in text_to_occurrences.items()
+        if len({uid for uid, _ in occs}) > 1
+    }
+
+    result = {}
+    for uid, posts in posts_by_user.items():
+        tweet_count = max(len(posts), 1)
+        shared_count = 0
+        max_coposters = 0
+        total_copost_events = 0
+
+        for p in posts:
+            norm = p["text"].strip().lower()
+            if not norm:
+                continue
+            if norm in shared_texts:
+                shared_count += 1
+                # count distinct other accounts posting same text within 60 s
+                try:
+                    my_ts = parse_ts(p["created_at"])
+                except Exception:
+                    my_ts = None
+
+                coposters = set()
+                for other_uid, other_ts in text_to_occurrences[norm]:
+                    if other_uid == uid:
+                        continue
+                    if my_ts is None or other_ts is None:
+                        coposters.add(other_uid)
+                    elif abs((other_ts - my_ts).total_seconds()) <= 60:
+                        coposters.add(other_uid)
+                n = len(coposters)
+                if n > max_coposters:
+                    max_coposters = n
+                total_copost_events += n
+
+        result[uid] = {
+            "shared_text_frac": shared_count / tweet_count,
+            "coposter_count": max_coposters,
+            "coord_coposter_total": total_copost_events / tweet_count,
+        }
+
+    return result
+
+
+
+def extract_features(user, posts, dataset_lang=None, coord=None):
     f = {}
     tweet_count = len(posts)
     f["tweet_count"] = tweet_count
@@ -70,6 +143,7 @@ def extract_features(user, posts, dataset_lang=None):
     f["description_hashtag_count"] = len(re.findall(r"#\w+", description))
     f["location_length"] = len(location)
     f["name_has_control_chars"] = int(any(ord(c) < 32 for c in name))
+
 
     if tweet_count >= 2:
         timestamps = sorted(parse_ts(p["created_at"]) for p in posts)
@@ -229,6 +303,36 @@ def extract_features(user, posts, dataset_lang=None):
         + 0.12 * min(1.0, f["posts_same_minute_max_frac"] / 0.15),
     )
 
+    if coord is not None:
+        f["shared_text_frac"] = coord.get("shared_text_frac", 0.0)
+        f["coposter_count"] = coord.get("coposter_count", 0.0)
+        f["coord_coposter_total"] = coord.get("coord_coposter_total", 0.0)
+    else:
+        f["shared_text_frac"] = 0.0
+        f["coposter_count"] = 0.0
+        f["coord_coposter_total"] = 0.0
+
+
+    if dataset_lang == "fr":
+        # FR bots often have low vocab richness + high duplicate fraction
+        # This gives the trees a positive "human-ness" axis for FR too
+        f["fr_organic_hint"] = (
+            uniq_txt
+            * min(1.0, f["vocab_richness"] * 2.0)
+            * max(0.0, 1.0 - burst_10 * 5.0)
+        )
+        # FR bot pressure: coordination + duplicates + timing
+        f["fr_bot_pressure"] = min(
+            1.0,
+            0.35 * min(1.0, f["shared_text_frac"])
+            + 0.30 * min(1.0, f["duplicate_fraction"])
+            + 0.20 * min(1.0, burst_10b / 0.10)
+            + 0.15 * min(1.0, f["posts_same_minute_max_frac"] / 0.20),
+        )
+    else:
+        f["fr_organic_hint"] = 0.0
+        f["fr_bot_pressure"] = 0.0
+
     return f
 
 
@@ -242,9 +346,18 @@ def load_dataset(dataset_path):
         posts_by_user[post["author_id"]].append(post)
 
     dataset_lang = data.get("lang")
+
+    # Build coordination index once for the whole dataset
+    coord_index = build_coordination_index(posts_by_user)
+
     user_ids = sorted(users.keys())
     feat_rows = [
-        extract_features(users[uid], posts_by_user[uid], dataset_lang)
+        extract_features(
+            users[uid],
+            posts_by_user[uid],
+            dataset_lang,
+            coord=coord_index.get(uid),
+        )
         for uid in user_ids
     ]
     feature_names = sorted(feat_rows[0].keys())
@@ -266,23 +379,51 @@ def competition_score_from_preds(y_true, y_pred):
     return score, tp, fn, fp
 
 
-def find_best_threshold(y_true, probs):
+def find_best_threshold(y_true, probs, fp_penalty_multiplier=1.0):
     """
     Maximize competition score; on ties prefer fewer FN, then fewer FP, then higher accuracy.
+    fp_penalty_multiplier: inflate FP cost during search to bias toward precision
+                           (use >1.0 when you want extra FP caution, e.g. for EN).
     """
     best = None
     n = len(y_true)
     for i in range(1, 200):
         thr = i / 200
         y_pred = (probs >= thr).astype(int)
-        score, tp, fn, fp = competition_score_from_preds(y_true, y_pred)
+        tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+        fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+        fp = int(np.sum((y_true == 0) & (y_pred == 1)))
         tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+        # Use adjusted score for threshold selection (real score for reporting)
+        adj_score = SCORE_TP * tp + SCORE_FN * fn + SCORE_FP * fp * fp_penalty_multiplier
+        real_score = SCORE_TP * tp + SCORE_FN * fn + SCORE_FP * fp
         acc = (tp + tn) / n if n else 0.0
-        # Lexicographic tie-break (all maximize except fp, fn).
-        key = (score, tp, -fn, -fp, acc, thr)
+        key = (adj_score, tp, -fn, -fp, acc, thr)
         if best is None or key > best[0]:
-            best = (key, score, thr, tp, fn, fp)
+            best = (key, real_score, thr, tp, fn, fp)
     return best[1], best[2], best[3], best[4], best[5]
+
+
+def hard_bot_signals(feat_dict, lang=None):
+    """
+    Returns True if at least one strong bot signal is present.
+    Used as a veto: if False, don't flag regardless of model probability.
+
+    FR: veto is skipped entirely (recall is the priority; FPs are rare).
+    EN: full precision gate applied.
+    """
+    if lang == "fr":
+        return True  # let the model decide for french don't block on hard rules
+    return (
+        feat_dict.get("burst_fraction_10s", 0) > 0.15
+        or feat_dict.get("duplicate_fraction", 0) > 0.25
+        or feat_dict.get("username_digit_ratio", 0) > 0.40
+        or feat_dict.get("posts_same_minute_max_frac", 0) > 0.45
+        or feat_dict.get("solicitation_fraction", 0) > 0.25
+        or feat_dict.get("name_has_control_chars", 0) > 0
+        or feat_dict.get("shared_text_frac", 0) > 0.40
+        or feat_dict.get("coposter_count", 0) >= 2
+    )
 
 
 class _BlendedProbaClassifier:
@@ -310,7 +451,7 @@ def _make_rf():
         min_samples_leaf=2,
         class_weight={0: 1.0, 1: 2.2},
         random_state=42,
-        n_jobs=-1,
+        n_jobs=1,
     )
 
 
@@ -379,13 +520,17 @@ def filter_pairs_by_lang(pairs, lang):
 
 
 def load_training_concat(pairs):
-    """Stack rows from multiple labeled datasets into one X, y."""
+    """
+    Stack rows from multiple labeled datasets into one X, y.
+    Deduplicates by user_id across datasets to prevent leakage.
+    """
     if not pairs:
         raise ValueError("No training pairs to load.")
 
     all_x_rows = []
     all_y = []
     feature_names = None
+    seen_uids: set = set()    
 
     for posts_json, bots_txt in pairs:
         user_ids, _, x_block, fn = load_dataset(posts_json)
@@ -394,19 +539,24 @@ def load_training_concat(pairs):
         elif fn != feature_names:
             raise ValueError(f"Feature mismatch: {fn} vs {feature_names}")
         bot_ids = load_bot_ids(bots_txt)
-        y_block = np.array([1 if uid in bot_ids else 0 for uid in user_ids], dtype=int)
-        all_x_rows.append(x_block)
-        all_y.append(y_block)
+        for uid, row in zip(user_ids, x_block):
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
+            label = 1 if uid in bot_ids else 0
+            all_x_rows.append(row)
+            all_y.append(label)
 
     x_train = np.vstack(all_x_rows)
-    y_train = np.concatenate(all_y)
+    y_train = np.array(all_y, dtype=int)
     return x_train, y_train
 
 
-def train_model(x_train, y_train, verbose=False, model="ensemble"):
+def train_model(x_train, y_train, verbose=False, model="ensemble", lang=None):
     """
     Fit classifier(s) + competition-score threshold (CV when possible).
     model: "rf" | "hgb" | "ensemble" (RF + HistGradientBoosting, averaged probs).
+    lang:  "en" | "fr" | None  — used to tune FP penalty in threshold search.
     Returns (clf, threshold, cv_info).
     """
     x_train = np.asarray(x_train, dtype=float)
@@ -417,6 +567,10 @@ def train_model(x_train, y_train, verbose=False, model="ensemble"):
     cv_info = None
     threshold = 0.45
 
+    # EN is near-perfect on precision; inflate FP penalty to keep it that way.
+    # FR has recall issues; use standard scoring to be more recall-friendly.
+    fp_mult = 1.5 if lang == "en" else 1.0
+
     def _cv_and_threshold(estimator):
         nonlocal threshold, cv_info
         desired = 5 if n_pos >= 20 else 3
@@ -426,7 +580,9 @@ def train_model(x_train, y_train, verbose=False, model="ensemble"):
         cv_probs = cross_val_predict(
             estimator, x_train, y_train, cv=cv, method="predict_proba"
         )[:, 1]
-        best_score, best_thr, tp, fn, fp = find_best_threshold(y_train, cv_probs)
+        best_score, best_thr, tp, fn, fp = find_best_threshold(
+            y_train, cv_probs, fp_penalty_multiplier=fp_mult
+        )
         threshold = best_thr
         cv_info = (best_score, best_thr, tp, fn, fp)
         if verbose:
@@ -458,7 +614,9 @@ def train_model(x_train, y_train, verbose=False, model="ensemble"):
                 :, 1
             ]
             blend = 0.5 * (pr_rf + pr_hgb)
-            best_score, best_thr, tp, fn, fp = find_best_threshold(y_train, blend)
+            best_score, best_thr, tp, fn, fp = find_best_threshold(
+                y_train, blend, fp_penalty_multiplier=fp_mult
+            )
             threshold = best_thr
             cv_info = (best_score, best_thr, tp, fn, fp)
             if verbose:
@@ -511,10 +669,17 @@ def main():
         default="ensemble",
         help="ensemble = RF + gradient boosting (default); rf / hgb = single model.",
     )
+    parser.add_argument(
+        "--no-hard-rules",
+        action="store_true",
+        help="Disable the hard-rule FP veto gate (use model probability alone).",
+    )
     args = parser.parse_args()
+    
 
     if args.train_dataset and args.train_bots:
         x_train, y_train = load_training_concat([(args.train_dataset, args.train_bots)])
+        train_lang = args.lang
     else:
         if args.lang is None:
             raise SystemExit("Provide --lang OR both --train-dataset and --train-bots.")
@@ -533,9 +698,12 @@ def main():
             print(f"  {pj}")
             print(f"  {bj}")
         x_train, y_train = load_training_concat(pairs)
+        train_lang = args.lang
 
     print(f"Training set users: {len(y_train)} (bots={int(np.sum(y_train))})")
-    clf, best_thr, cv_info = train_model(x_train, y_train, verbose=False, model=args.model)
+    clf, best_thr, cv_info = train_model(
+        x_train, y_train, verbose=False, model=args.model, lang=train_lang
+    )
     if cv_info:
         best_score, best_thr, tp, fn, fp = cv_info
         print(f"CV-optimized threshold: {best_thr:.2f}")
@@ -543,14 +711,34 @@ def main():
     else:
         print(f"CV skipped (small classes); using default threshold: {best_thr:.2f}")
 
-    target_user_ids, _, x_target, _ = load_dataset(args.dataset)
+    target_user_ids, target_users, x_target, feat_names = load_dataset(args.dataset)
     target_probs = clf.predict_proba(x_target)[:, 1]
-    flagged = [uid for uid, p in zip(target_user_ids, target_probs) if p >= best_thr]
+
+
+    #debug
+    for uid, prob, feat_row in zip(target_user_ids, target_probs, x_target):
+        feat_dict = dict(zip(feat_names, feat_row))
+        if prob > 0.3:
+            print(f"{uid}  prob={prob:.3f}  shared={feat_dict['shared_text_frac']:.2f}  copost={feat_dict['coposter_count']:.0f}  fr_bot={feat_dict['fr_bot_pressure']:.2f}  dup={feat_dict['duplicate_fraction']:.2f}  burst={feat_dict['burst_fraction_10s']:.2f}")
+    
+    
+    use_hard_rules = not args.no_hard_rules
+    flagged = []
+    for uid, prob, feat_row in zip(target_user_ids, target_probs, x_target):
+        if prob < best_thr:
+            continue
+        if use_hard_rules:
+            feat_dict = dict(zip(feat_names, feat_row))
+            if not hard_bot_signals(feat_dict, lang=args.lang):
+                continue
+        flagged.append(uid)
 
     with open(args.output, "w", encoding="utf-8") as fh:
         for uid in sorted(flagged):
             fh.write(uid + "\n")
     print(f"Flagged {len(flagged)} / {len(target_user_ids)} users")
+    if use_hard_rules:
+        print("(Hard-rule FP veto gate: enabled)")
     print(f"Detections written to: {args.output}")
 
     if args.eval_bots:

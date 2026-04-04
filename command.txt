@@ -1,4 +1,0 @@
-python test_all_datasets.py
-python test_all_datasets.py --lang en
-python test_all_datasets.py --lang fr
-python test_all_datasets.py --verbose-cv
